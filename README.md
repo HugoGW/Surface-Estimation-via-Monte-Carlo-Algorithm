@@ -1,9 +1,4 @@
 # Surface-Estimation-via-Monte-Carlo-Algorithm
-Numerical estimation of contour area with an MC alogithm to determine the area of a country
-
-Here's a complete `README.md` in English, documenting your Pygame-based interactive map tool, including purpose, setup, and step-by-step explanation of the code logic:
-
----
 
 ## Overview
 
