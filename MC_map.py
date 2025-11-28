@@ -1,13 +1,13 @@
 import pygame
-from itertools import combinations
+import numpy as np
+from numba import jit, prange
 import math
-import random
 
 # Initialisation de Pygame
 pygame.init()
 
 # Chargement de l'image de la carte
-image_path = "/home/hugo-alexandre/pCloudDrive/Python/code_python_1m2p/MC_map/flat_earth.png"  # Remplace par le chemin de ton image
+image_path = "/home/hugo-alexandre/pCloudDrive/Python/code_python_1m2p/MC_map/Antarctica.png"
 image = pygame.image.load(image_path)
 
 # Création de la fenêtre
@@ -15,105 +15,199 @@ screen = pygame.display.set_mode(image.get_size())
 pygame.display.set_caption("Carte interactive")
 
 # Police pour l'affichage des valeurs de l'échelle
-font = pygame.font.Font(None, 36)  # Texte plus grand
+font = pygame.font.Font(None, 36)
 
-# Liste pour stocker les tracés
+# Variables globales
 traces = []
 current_trace = []
-scale_lines = []  # Liste pour stocker les traits de mesure
-scale_labels = []  # Liste pour stocker les valeurs de l'échelle
+scale_lines = []
+scale_labels = []
 measuring = False
 measure_start = None
 input_active = False
 input_text = ""
 latest_distance = None
-scale_ratio = None  # Ratio km/px
-estimated_area_km2 = None  # Stocker la surface estimée
+scale_ratio = None
+estimated_area_km2 = None
 
-# Fonction d'affichage
+
+@jit(nopython=True)
+def ccw(ax, ay, bx, by, cx, cy):
+    """Test de sens trigonométrique optimisé"""
+    return (cy - ay) * (bx - ax) > (by - ay) * (cx - ax)
+
+
+@jit(nopython=True)
+def segments_intersect_numba(p1x, p1y, p2x, p2y, q1x, q1y, q2x, q2y):
+    """Vérifie si deux segments s'intersectent (optimisé Numba)"""
+    return (ccw(p1x, p1y, q1x, q1y, q2x, q2y) != ccw(p2x, p2y, q1x, q1y, q2x, q2y) and
+            ccw(p1x, p1y, p2x, p2y, q1x, q1y) != ccw(p1x, p1y, p2x, p2y, q2x, q2y))
+
+
+@jit(nopython=True)
+def check_intersection_numba(segments):
+    """Vérifie les intersections entre segments (parallélisé)"""
+    n = len(segments)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if segments_intersect_numba(
+                segments[i, 0, 0], segments[i, 0, 1],
+                segments[i, 1, 0], segments[i, 1, 1],
+                segments[j, 0, 0], segments[j, 0, 1],
+                segments[j, 1, 0], segments[j, 1, 1]
+            ):
+                return True
+    return False
+
+
+@jit(nopython=True, parallel=True)
+def point_in_polygon_batch(points_x, points_y, polygon):
+    """Teste si des points sont dans un polygone (parallélisé avec Numba)"""
+    n_points = len(points_x)
+    n_vertices = len(polygon)
+    results = np.zeros(n_points, dtype=np.bool_)
+    
+    for idx in prange(n_points):
+        x, y = points_x[idx], points_y[idx]
+        inside = False
+        
+        j = n_vertices - 1
+        for i in range(n_vertices):
+            xi, yi = polygon[i, 0], polygon[i, 1]
+            xj, yj = polygon[j, 0], polygon[j, 1]
+            
+            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        
+        results[idx] = inside
+    
+    return results
+
+
+@jit(nopython=True, parallel=True)
+def estimate_area_monte_carlo(min_x, max_x, min_y, max_y, polygon, num_samples, seed=42):
+    """Estimation de surface par Monte Carlo (parallélisé)"""
+    np.random.seed(seed)
+    
+    # Génération de tous les points aléatoires en une fois
+    x_coords = np.random.randint(min_x, max_x + 1, num_samples)
+    y_coords = np.random.randint(min_y, max_y + 1, num_samples)
+    
+    # Test parallélisé
+    inside = point_in_polygon_batch(x_coords, y_coords, polygon)
+    
+    points_inside = np.sum(inside)
+    bounding_box_area = (max_x - min_x) * (max_y - min_y)
+    estimated_area = (points_inside / num_samples) * bounding_box_area
+    
+    return estimated_area, points_inside
+
+
 def draw():
+    """Fonction d'affichage optimisée"""
     screen.blit(image, (0, 0))
+    
+    # Dessiner tous les tracés
     for trace in traces:
         if len(trace) > 1:
             pygame.draw.lines(screen, (255, 0, 0), False, trace, 2)
+    
     if len(current_trace) > 1:
         pygame.draw.lines(screen, (255, 0, 0), False, current_trace, 2)
+    
+    # Dessiner les lignes d'échelle
     for i, line in enumerate(scale_lines):
         pygame.draw.line(screen, (0, 255, 0), line[0], line[1], 2)
-        text_surface = font.render(scale_labels[i], True, (0, 0, 0))  # Texte en noir
+        text_surface = font.render(scale_labels[i], True, (0, 0, 0))
         mid_x = (line[0][0] + line[1][0]) // 2
-        mid_y = (line[0][1] + line[1][1]) // 2 - 40  # Décale le texte au-dessus du trait
+        mid_y = (line[0][1] + line[1][1]) // 2 - 40
         screen.blit(text_surface, (mid_x - text_surface.get_width() // 2, mid_y))
+    
+    # Interface de saisie
     if input_active:
         input_surface = font.render(f"Distance réelle (km) : {input_text}", True, (0, 0, 0))
         input_bg_rect = pygame.Rect(10, 10, input_surface.get_width() + 10, input_surface.get_height() + 5)
-        pygame.draw.rect(screen, (255, 255, 255), input_bg_rect)  # Fond blanc
+        pygame.draw.rect(screen, (255, 255, 255), input_bg_rect)
         screen.blit(input_surface, (input_bg_rect.x + 5, input_bg_rect.y))
     
+    # Affichage de la surface
     if estimated_area_km2 is not None:
-        area_surface = font.render(f"Surface estimée : {estimated_area_km2:.2f} km²", True, (0, 0, 0))
+        area_surface = font.render(f"Surface : {estimated_area_km2:.2f} km²", True, (0, 0, 0))
         area_bg_rect = pygame.Rect(10, 40, area_surface.get_width() + 10, area_surface.get_height() + 5)
-        pygame.draw.rect(screen, (255, 255, 255), area_bg_rect)  # Fond blanc
+        pygame.draw.rect(screen, (255, 255, 255), area_bg_rect)
         screen.blit(area_surface, (area_bg_rect.x + 5, area_bg_rect.y))
-
+    
     pygame.display.flip()
 
-# Autres fonctions inchangées...
-
-def segments_intersect(p1, p2, q1, q2):
-    def ccw(a, b, c):
-        return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
-    return ccw(p1, q1, q2) != ccw(p2, q1, q2) and ccw(p1, p2, q1) != ccw(p1, p2, q2)
 
 def check_intersection():
-    all_segments = [(trace[i], trace[i+1]) for trace in traces for i in range(len(trace)-1)]
-    for (p1, p2), (q1, q2) in combinations(all_segments, 2):
-        if segments_intersect(p1, p2, q1, q2):
-            print("Contour fermé trouvé !")
-            estimate_area()
-            return True
-        #print("Le contour n'est pas fermé.")
+    """Vérifie les intersections avec conversion pour Numba"""
+    if not traces:
+        return False
+    
+    # Conversion des traces en array NumPy pour Numba
+    all_segments = []
+    for trace in traces:
+        for i in range(len(trace) - 1):
+            all_segments.append([trace[i], trace[i+1]])
+    
+    if len(all_segments) < 2:
+        return False
+    
+    segments_array = np.array(all_segments, dtype=np.float64)
+    
+    if check_intersection_numba(segments_array):
+        print("Contour fermé trouvé !")
+        estimate_area()
+        return True
+    
     return False
 
+
 def estimate_area():
+    """Estimation de la surface avec affichage progressif"""
     global estimated_area_km2
+    
     if not traces or scale_ratio is None:
         return
     
-    min_x = min(point[0] for trace in traces for point in trace)
-    max_x = max(point[0] for trace in traces for point in trace)
-    min_y = min(point[1] for trace in traces for point in trace)
-    max_y = max(point[1] for trace in traces for point in trace)
+    # Conversion du polygone en array NumPy
+    all_points = [point for trace in traces for point in trace]
+    polygon = np.array(all_points, dtype=np.float64)
     
-    bounding_box_area_px = (max_x - min_x) * (max_y - min_y)
+    min_x = int(np.min(polygon[:, 0]))
+    max_x = int(np.max(polygon[:, 0]))
+    min_y = int(np.min(polygon[:, 1]))
+    max_y = int(np.max(polygon[:, 1]))
     
-    num_samples = 100000
-    points_inside = 0
+    # Calcul par batch pour affichage progressif
+    total_samples = 5000000  # Augmenté pour plus de précision
+    batch_size = int(total_samples/10)
+    total_inside = 0
+    total_processed = 0
     
-    for i in range(num_samples):
-        x_rand = random.randint(min_x, max_x)
-        y_rand = random.randint(min_y, max_y)
+    for batch_num in range(0, total_samples, batch_size):
+        current_batch = min(batch_size, total_samples - batch_num)
         
-        inside = False
-        for trace in traces:
-            for j in range(len(trace) - 1):
-                p1, p2 = trace[j], trace[j+1]
-                if (p1[1] > y_rand) != (p2[1] > y_rand) and \
-                   (x_rand < (p2[0] - p1[0]) * (y_rand - p1[1]) / (p2[1] - p1[1]) + p1[0]):
-                    inside = not inside
-        if inside:
-            points_inside += 1
+        estimated_area_px, points_inside = estimate_area_monte_carlo(
+            min_x, max_x, min_y, max_y, polygon, current_batch, seed=42 + batch_num
+        )
         
-        # Mise à jour de l'affichage tous les 500 points
-        if (i + 1) % 500 == 0 or i == num_samples - 1:
-            estimated_area_px = (points_inside / (i + 1)) * bounding_box_area_px
-            estimated_area_km2 = (estimated_area_px * (scale_ratio ** 2))
-            draw()  # Met à jour l'affichage
-
-    print(f"Surface finale estimée : {estimated_area_km2:.2f} km²")
-
+        total_inside += points_inside
+        total_processed += current_batch
+        
+        # Calcul de la surface totale
+        bounding_box_area = (max_x - min_x) * (max_y - min_y)
+        estimated_area_px = (total_inside / total_processed) * bounding_box_area
+        estimated_area_km2 = estimated_area_px * (scale_ratio ** 2)
+        
+        draw()  # Mise à jour visuelle
     
+    print(f"Surface finale estimée : {estimated_area_km2:.2f} km² ({total_samples} échantillons)")
 
+
+# Boucle principale
 running = True
 mouse_pressed = False
 
@@ -121,12 +215,16 @@ while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+        
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 running = False
+            
             elif event.key == pygame.K_DELETE:
                 if traces:
                     traces.pop()
+                    estimated_area_km2 = None
+            
             elif event.key == pygame.K_RETURN:
                 if measuring and input_active:
                     try:
@@ -139,10 +237,13 @@ while running:
                     input_text = ""
                 elif check_intersection():
                     measuring = True
+            
             elif input_active and event.key == pygame.K_BACKSPACE:
                 input_text = input_text[:-1]
+            
             elif input_active:
                 input_text += event.unicode
+        
         elif event.type == pygame.MOUSEBUTTONDOWN:
             if event.button == 1:
                 if measuring:
@@ -157,14 +258,17 @@ while running:
                 else:
                     mouse_pressed = True
                     current_trace = [event.pos]
+        
         elif event.type == pygame.MOUSEBUTTONUP:
             if event.button == 1:
                 mouse_pressed = False
                 if len(current_trace) > 1:
                     traces.append(current_trace)
                 current_trace = []
+        
         elif event.type == pygame.MOUSEMOTION and mouse_pressed:
             current_trace.append(event.pos)
+    
     draw()
 
 pygame.quit()
