@@ -7,7 +7,7 @@ import math
 pygame.init()
 
 # Chargement de l'image de la carte
-image_path = "/home/hugo-alexandre/pCloudDrive/Python/code_python_1m2p/MC_map/Antarctica.png"
+image_path = "/home/hugo-alexandre/pCloudDrive/Python/code_python_1m2p/MC_map/France_map.png"
 image = pygame.image.load(image_path)
 
 # Création de la fenêtre
@@ -16,6 +16,9 @@ pygame.display.set_caption("Carte interactive")
 
 # Police pour l'affichage des valeurs de l'échelle
 font = pygame.font.Font(None, 36)
+
+# Distance à partir de laquelle on masque l'encart d'instruction
+INSTRUCTION_HIDE_DISTANCE = 150
 
 # Variables globales
 traces = []
@@ -29,6 +32,7 @@ input_text = ""
 latest_distance = None
 scale_ratio = None
 estimated_area_km2 = None
+current_step = "draw_contour"  # Étapes: draw_contour, set_scale, calculating, done
 
 
 @jit(nopython=True)
@@ -104,9 +108,16 @@ def estimate_area_monte_carlo(min_x, max_x, min_y, max_y, polygon, num_samples, 
     return estimated_area, points_inside
 
 
+def is_mouse_near_rect(pos, rect, distance):
+    """Renvoie True si la souris est à moins de `distance` pixels du rectangle."""
+    expanded = rect.inflate(distance * 2, distance * 2)
+    return expanded.collidepoint(pos)
+
+
 def draw():
     """Fonction d'affichage optimisée"""
     screen.blit(image, (0, 0))
+    mouse_pos = pygame.mouse.get_pos()
     
     # Dessiner tous les tracés
     for trace in traces:
@@ -124,25 +135,60 @@ def draw():
         mid_y = (line[0][1] + line[1][1]) // 2 - 40
         screen.blit(text_surface, (mid_x - text_surface.get_width() // 2, mid_y))
     
-    # Interface de saisie
+    # Affichage des instructions selon l'étape
+    instruction_text = ""
+    instruction_color = (0, 0, 0)
+    
+    if current_step == "draw_contour":
+        instruction_text = "ÉTAPE 1 : Dessinez le contour puis appuyez sur ENTRÉE"
+        instruction_color = (255, 100, 0)
+    elif current_step == "set_scale":
+        if measure_start is None:
+            instruction_text = "ÉTAPE 2 : Cliquez sur le DÉBUT de la ligne d'échelle"
+            instruction_color = (0, 150, 0)
+        else:
+            instruction_text = "ÉTAPE 2 : Cliquez sur la FIN de la ligne d'échelle"
+            instruction_color = (0, 150, 0)
+    elif current_step == "calculating":
+        instruction_text = "CALCUL EN COURS... Veuillez patienter"
+        instruction_color = (200, 0, 200)
+    elif current_step == "done":
+        instruction_text = "Calcul Terminé... (Appuyez sur DELETE pour recommencer)"
+        instruction_color = (0, 100, 200)
+    
+    # Affichage de l'instruction principale
+    if instruction_text:
+        inst_surface = font.render(instruction_text, True, instruction_color)
+        inst_bg_rect = pygame.Rect(10, 10, inst_surface.get_width() + 20, inst_surface.get_height() + 10)
+        # Masque l'encart si la souris est trop proche pour libérer la vue
+        if not is_mouse_near_rect(mouse_pos, inst_bg_rect, INSTRUCTION_HIDE_DISTANCE):
+            pygame.draw.rect(screen, (255, 255, 255), inst_bg_rect)
+            pygame.draw.rect(screen, instruction_color, inst_bg_rect, 3)
+            screen.blit(inst_surface, (inst_bg_rect.x + 10, inst_bg_rect.y + 5))
+    
+    # Interface de saisie de la distance
     if input_active:
         input_surface = font.render(f"Distance réelle (km) : {input_text}", True, (0, 0, 0))
-        input_bg_rect = pygame.Rect(10, 10, input_surface.get_width() + 10, input_surface.get_height() + 5)
+        input_bg_rect = pygame.Rect(10, 70, input_surface.get_width() + 20, input_surface.get_height() + 10)
         pygame.draw.rect(screen, (255, 255, 255), input_bg_rect)
-        screen.blit(input_surface, (input_bg_rect.x + 5, input_bg_rect.y))
+        pygame.draw.rect(screen, (0, 150, 0), input_bg_rect, 3)
+        screen.blit(input_surface, (input_bg_rect.x + 10, input_bg_rect.y + 5))
     
     # Affichage de la surface
     if estimated_area_km2 is not None:
-        area_surface = font.render(f"Surface : {estimated_area_km2:.2f} km²", True, (0, 0, 0))
-        area_bg_rect = pygame.Rect(10, 40, area_surface.get_width() + 10, area_surface.get_height() + 5)
+        area_surface = font.render(f"Surface estimée : {estimated_area_km2:.2f} km²", True, (0, 100, 200))
+        area_bg_rect = pygame.Rect(10, 130, area_surface.get_width() + 20, area_surface.get_height() + 10)
         pygame.draw.rect(screen, (255, 255, 255), area_bg_rect)
-        screen.blit(area_surface, (area_bg_rect.x + 5, area_bg_rect.y))
+        pygame.draw.rect(screen, (0, 100, 200), area_bg_rect, 3)
+        screen.blit(area_surface, (area_bg_rect.x + 10, area_bg_rect.y + 5))
     
     pygame.display.flip()
 
 
 def check_intersection():
     """Vérifie les intersections avec conversion pour Numba"""
+    global current_step
+    
     if not traces:
         return False
     
@@ -159,6 +205,7 @@ def check_intersection():
     
     if check_intersection_numba(segments_array):
         print("Contour fermé trouvé !")
+        current_step = "set_scale"
         estimate_area()
         return True
     
@@ -167,7 +214,7 @@ def check_intersection():
 
 def estimate_area():
     """Estimation de la surface avec affichage progressif"""
-    global estimated_area_km2
+    global estimated_area_km2, current_step
     
     if not traces or scale_ratio is None:
         return
@@ -182,8 +229,8 @@ def estimate_area():
     max_y = int(np.max(polygon[:, 1]))
     
     # Calcul par batch pour affichage progressif
-    total_samples = 5000000  # Augmenté pour plus de précision
-    batch_size = int(total_samples/10)
+    total_samples = 50000000  # Augmenté pour plus de précision
+    batch_size = int(total_samples/100)
     total_inside = 0
     total_processed = 0
     
@@ -205,6 +252,8 @@ def estimate_area():
         draw()  # Mise à jour visuelle
     
     print(f"Surface finale estimée : {estimated_area_km2:.2f} km² ({total_samples} échantillons)")
+    current_step = "done"
+    draw()
 
 
 # Boucle principale
@@ -224,6 +273,10 @@ while running:
                 if traces:
                     traces.pop()
                     estimated_area_km2 = None
+                    current_step = "draw_contour"
+                    scale_lines.clear()
+                    scale_labels.clear()
+                    scale_ratio = None
             
             elif event.key == pygame.K_RETURN:
                 if measuring and input_active:
@@ -231,6 +284,10 @@ while running:
                         real_distance_km = float(input_text)
                         scale_ratio = real_distance_km / latest_distance
                         scale_labels[-1] = f"{scale_ratio:.3f} km/px"
+                        current_step = "calculating"
+                        draw()
+                        # Lancer le calcul de la surface
+                        estimate_area()
                     except ValueError:
                         scale_labels[-1] = "Erreur: Entrée invalide"
                     input_active = False
